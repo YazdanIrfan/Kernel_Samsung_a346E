@@ -1,22 +1,6 @@
 ###############################################################################
 # Build A346E Kernel -- Samsung Galaxy A34 5G (a34x), MediaTek mt6877, GKI 6.6
-#
-# Pipeline (7 boxes, linear):
-#   #1 Checkout & Detect → #2 System Prep → #3 External Deps → #4 Patches
-#     → #5 KernelSU → #6 Build → #7 Upload & Summary
-#
-# #1..#5 are FAST pre-flight jobs (~1 min each): they validate everything the
-# build needs -- every patch is dry-run applied, the KernelSU-Next version is
-# resolved, the defconfig plan is printed -- so a broken patch fails the run in
-# a minute instead of 50 minutes into the compile.
-# #6 is the real build: it is self-contained (it re-does checkout, deps, KSU,
-# patches) because every job runs on its OWN fresh runner. That is also why the
-# permissive patch is applied by build_kernel.sh (apply_optional_patches) and
-# not by a pre-flight job -- doing it in a pre-flight job silently produced an
-# ENFORCING kernel while the artifact said "permissive".
-#
-# Variant: workflow_dispatch picks ONE of NO-ROOT / KSUN / KSUN-SUSFS-v1.5.12.
-# A push to arena/** builds KSUN (that is the variant we actually flash).
+# Pipeline updated for KernelSU-Next & SUSFS v2.2.0
 ###############################################################################
 name: Build A346E Kernel
 
@@ -30,8 +14,8 @@ on:
         options:
           - NO-ROOT
           - KSUN
-          - KSUN-SUSFS-v1.5.12
-        default: KSUN
+          - KSUN-SUSFS-v2.2.0
+        default: KSUN-SUSFS-v2.2.0
       permissive:
         description: "Make SELinux permissive?"
         type: boolean
@@ -55,16 +39,13 @@ permissions:
   contents: read
   issues: write
 
-# a newer push on the same branch supersedes older, still running builds
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   G_EXT: ${{ github.workspace }}/external_deps
-  # workflow_dispatch: whatever the user picked.
-  # push on arena/**: build KSUN (that is the variant we actually flash).
-  KSU_VAR: ${{ github.event.inputs.ksu_variant || (github.event_name == 'push' && 'KSUN') || 'NO-ROOT' }}
+  KSU_VAR: ${{ github.event.inputs.ksu_variant || (github.event_name == 'push' && 'KSUN-SUSFS-v2.2.0') || 'NO-ROOT' }}
   PERMISSIVE: ${{ github.event.inputs.permissive || 'false' }}
   CUSTOM_PATCH: ${{ github.event.inputs.custom_patches || 'false' }}
 
@@ -77,7 +58,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
@@ -111,7 +92,8 @@ jobs:
             echo "| option | value |"
             echo "|---|---|"
             echo "| KSU variant | \`${KSU_VAR}\` |"
-            echo "| KSUN source | \`dev branch HEAD (latest at run time)\` |"
+            echo "| KSUN source | \`KernelSU-Next latest\` |"
+            echo "| SUSFS Version | \`v2.2.0\` |"
             echo "| SELinux | \`${SEL}\` |"
             echo "| Extra patches (patch/*.patch) | \`${CUSTOM_PATCH}\` |"
             echo "| Kernel tree | \`${REAL_DIR}\` |"
@@ -134,7 +116,6 @@ jobs:
           set -eu
           AVAIL=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           echo "CPUs: $(nproc) | RAM: $(free -g | awk '/Mem:/{print $2}') GB | free disk: ${AVAIL} GB"
-          # #6 frees ~25 GB more (dotnet/ghc/android-sdk) before building
           if [ "$AVAIL" -lt 10 ]; then
             echo "::error::only ${AVAIL} GB free on / - the kleaf build cannot fit"
             exit 1
@@ -146,7 +127,7 @@ jobs:
           echo "### #2 System Prep - OK (${AVAIL} GB free before cleanup)" >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
-  # #3 External Deps (KSU / SUSFS)
+  # #3 External Deps (KSU / SUSFS v2.2.0)
   # ==========================================================================
   external-deps:
     name: "#3 External Deps (KSU/SUSFS)"
@@ -161,32 +142,23 @@ jobs:
           if [ "$KSU_VAR" = "KSUN" ]; then
             URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev/kernel/setup.sh"
           else
-            URL="https://raw.githubusercontent.com/xnnnsets/KernelSU-Next/refs/heads/next-1/kernel/setup.sh"
+            URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/next/kernel/setup.sh"
           fi
           curl -fsSL --retry 3 "$URL" -o /tmp/setup.sh
           head -n 1 /tmp/setup.sh | grep -q '^#!' || { echo "::error::setup.sh does not look like a script"; exit 1; }
           echo "setup.sh OK ($(wc -l < /tmp/setup.sh) lines) from $URL"
 
-      - name: Fetch & verify SUSFS repos
-        if: env.KSU_VAR == 'KSUN-SUSFS-v1.5.12'
+      - name: Fetch & verify SUSFS v2.2.0 repos
+        if: env.KSU_VAR == 'KSUN-SUSFS-v2.2.0'
         run: |
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          ( cd susfs4ksu
-            git fetch --depth 1 origin f450ec00bf592d080f59b01ff6f9242456c9a427 || true
-            git checkout f450ec00bf592d080f59b01ff6f9242456c9a427 || echo "::warning::pinned SUSFS commit unavailable, HEAD used" )
-          for repo in https://github.com/xnnnsets/kernel_patches.git \
-                      https://github.com/xnnnsets/patch.git \
-                      https://github.com/SukiSU-Ultra/SukiSU_patch.git; do
-            git clone "$repo" --depth 1
-          done
           MISSING=0
-          for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
-                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
-                   "patch/6.6/Dont_reduce_TTL.patch" \
-                   "kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" \
-                   "kernel_patches/wild/susfs_fix_patches/v1.5.12/1_fix_base.c.patch"; do
+          for f in "susfs4ksu/kernel_patches/fs/susfs.c" \
+                   "susfs4ksu/kernel_patches/include/linux/susfs.h" \
+                   "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
+                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"; do
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
           done
           [ "$MISSING" = "0" ] || exit 1
@@ -202,11 +174,7 @@ jobs:
           echo "### #3 External Deps - OK (${KSU_VAR})" >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
-  # #4 Patches -- dry-run EVERY patch that the build will apply.
-  #    Order/behaviour mirrors build_kernel.sh exactly:
-  #      always : kernel/patches-kernel-6.6/*.patch (apply_kernel66_patches)
-  #      if PERMISSIVE=true : Permissive/selinux-make-permissive.patch
-  #      if CUSTOM_PATCH=true : patch/*.patch      (apply_optional_patches)
+  # #4 Patches
   # ==========================================================================
   patches:
     name: "#4 Patches"
@@ -214,15 +182,11 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
 
-      # Every job runs on its own runner: detect locally instead of pulling an
-      # output from a job that is not a *direct* dependency -- needs.<job> only
-      # resolves for direct needs, so `needs.detect.*` here silently expanded to
-      # an empty string and every path check failed.
       - name: Detect kernel dir
         run: |
           set -eu
@@ -230,11 +194,6 @@ jobs:
           elif [ -f "kernel-6.6/Makefile" ]; then echo "KDIR=kernel-6.6" >> "$GITHUB_ENV"
           else echo "::error::no kernel tree found"; exit 1; fi
 
-      # kernel-6.6/ is pristine upstream; everything this device needs is a
-      # patch in kernel/patches-kernel-6.6/, applied on every build by
-      # build_kernel.sh (apply_kernel66_patches -> that folder's apply.sh).
-      # Dry-run them here so a patch that no longer fits a freshly uploaded
-      # kernel tree fails the run in a minute instead of 50 min into the build.
       - name: kernel-6.6 patches (always applied)
         run: |
           set -eu
@@ -243,14 +202,11 @@ jobs:
           chmod +x "$A"
           bash "$A" --check "$KDIR"
 
-      # These fixes live directly in Samsung's own trees (vendor/,
-      # kernel/kernel_device_modules-6.6/) because we never replace those
-      # wholesale - just make sure none of them got lost.
       - name: Verify in-tree fixes (vendor / device modules)
         run: |
           set -eu
           FAIL=0
-          check() { # check <description> <file> <grep-pattern>
+          check() {
             if [ -f "$2" ] && grep -q "$3" "$2"; then
               echo "OK      $1"
             else
@@ -260,15 +216,10 @@ jobs:
           check "SEC_PM Kconfig"           "kernel/kernel_device_modules-6.6/drivers/samsung/pm/Kconfig" "config SEC_PM"
           check "MAX/MIN guard (stp_uart)" "vendor/mediatek/kernel_modules/connectivity/common/common_main/linux/stp_uart.c" "#ifndef MAX"
 
-          # audio: both BTCVSD fixes must survive (call crackle resync and the
-          # mic-start pop silence priming) -- they live in the device module
-          # tree, so nothing else would notice if one got dropped.
           check "BTCVSD SCO resync/xrun recovery" "kernel/kernel_device_modules-6.6/sound/soc/mediatek/common/mtk-btcvsd.c" "mtk_btcvsd_snd_band_resync"
           check "BTCVSD rx overrun self-recovery" "kernel/kernel_device_modules-6.6/sound/soc/mediatek/common/mtk-btcvsd.c" "mtk_btcvsd_snd_rx_resync"
           check "BTCVSD silence priming"          "kernel/kernel_device_modules-6.6/sound/soc/mediatek/common/mtk-btcvsd.c" "mtk_btcvsd_snd_silence_prime"
 
-          # zram: upstream line is `= CONFIG_ZRAM_DEF_COMP;`. A hand-edit once
-          # turned it into `= lzo-rle;` (no quotes) -> build error.
           Z="$KDIR/drivers/block/zram/zram_drv.c"
           if grep -qE '^static const char \*default_compressor = (CONFIG_ZRAM_DEF_COMP|"[a-z0-9-]+");' "$Z"; then
             echo "OK      zram default_compressor is valid C"
@@ -276,7 +227,6 @@ jobs:
             echo "::error::BROKEN zram default_compressor:"; grep -n "default_compressor =" "$Z" || true; FAIL=1
           fi
 
-          # Samsung-only cred API must be gone from the modules we build
           if grep -rl --include=*.c --include=*.h "get_current_cred_module\|put_cred_module" vendor 2>/dev/null | grep -q .; then
             echo "::error::get_current_cred_module/put_cred_module still present in vendor/:"
             grep -rl --include=*.c --include=*.h "get_current_cred_module\|put_cred_module" vendor 2>/dev/null | sed 's/^/          /'
@@ -300,11 +250,6 @@ jobs:
           else
             echo "::error::permissive patch does not apply"; cat /tmp/perm.log; exit 1
           fi
-          echo "SELinux will be PERMISSIVE (applied for real in #6 by build_kernel.sh)"
-
-      - name: Skip permissive (PERMISSIVE=false)
-        if: env.PERMISSIVE != 'true'
-        run: echo "PERMISSIVE=false -> SELinux stays enforcing, permissive patch not applied"
 
       - name: Extra patches from patch/*.patch (CUSTOM_PATCH=true)
         if: env.CUSTOM_PATCH == 'true'
@@ -314,7 +259,7 @@ jobs:
           EXTRA=(patch/*.patch)
           shopt -u nullglob
           if [ ${#EXTRA[@]} -eq 0 ]; then
-            echo "::warning::CUSTOM_PATCH=true but patch/ has no *.patch file (kernel/patches-kernel-6.6/ is applied anyway)"
+            echo "::warning::CUSTOM_PATCH=true but patch/ has no *.patch file"
             exit 0
           fi
           FAIL=0
@@ -329,7 +274,6 @@ jobs:
             fi
           done
           [ "$FAIL" = "0" ] || exit 1
-          echo "extra patches: ${#EXTRA[@]} checked (applied for real in #6 by build_kernel.sh)"
 
       - name: Summary
         run: |
@@ -341,8 +285,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
-  # #5 KernelSU -- resolve the version that #6 will build and show the
-  #    defconfig plan. No tag/pinning: always dev branch HEAD.
+  # #5 KernelSU
   # ==========================================================================
   kernelsu:
     name: "#5 KernelSU"
@@ -355,11 +298,8 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
-          if [ "$KSU_VAR" = "KSUN" ]; then
-            REPO=https://github.com/KernelSU-Next/KernelSU-Next.git; BRANCH=dev
-          else
-            REPO=https://github.com/xnnnsets/KernelSU-Next.git;      BRANCH=next-1
-          fi
+          REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
+          BRANCH=$([ "$KSU_VAR" = "KSUN" ] && echo "dev" || echo "next")
           git clone --branch "$BRANCH" "$REPO" /tmp/ksun >/dev/null 2>&1
           cd /tmp/ksun
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
@@ -369,8 +309,6 @@ jobs:
             echo "ksu_tag=$TAG"; echo "ksu_code=$CODE"; echo "ksu_sha=$SHA"
           } >> "$GITHUB_OUTPUT"
           echo "KernelSU-Next $BRANCH: $TAG ($CODE) @ $SHA"
-          grep -q KSU_VERSION_FALLBACK kernel/Kbuild \
-            || echo "::warning::kernel/Kbuild has no KSU_VERSION_FALLBACK - the v0.0.1 fix may need updating"
 
       - name: Defconfig plan
         run: |
@@ -378,17 +316,16 @@ jobs:
           echo "gki_defconfig additions for $KSU_VAR (between the '# >>> a346e-ci' markers):"
           case "$KSU_VAR" in
             KSUN)               echo "  CONFIG_KSU=y, CONFIG_KPROBES=y, CONFIG_KPROBE_EVENTS=y, CONFIG_MODULES=y" ;;
-            KSUN-SUSFS-v1.5.12) echo "  CONFIG_KSU=y, CONFIG_KSU_KPROBES_HOOK=n + 15 CONFIG_KSU_SUSFS_* options" ;;
+            KSUN-SUSFS-v2.2.0)  echo "  CONFIG_KSU=y, CONFIG_KSU_SUSFS=y (v2.2.0 specific flags)" ;;
             NO-ROOT)            echo "  (none)" ;;
           esac
-          echo "  + CONFIG_IP_SET* (all variants)"
           {
             echo "### #5 KernelSU - OK"
             echo "- KernelSU-Next: \`${{ steps.resolve.outputs.ksu_tag || 'n/a' }}\` (\`${{ steps.resolve.outputs.ksu_code || 'n/a' }}\`) @ \`${{ steps.resolve.outputs.ksu_sha || 'n/a' }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ==========================================================================
-  # #6 Build -- the real one. Self-contained: fresh runner, fresh checkout.
+  # #6 Build
   # ==========================================================================
   build:
     name: "#6 Build"
@@ -403,7 +340,7 @@ jobs:
       ksu_tag: ${{ steps.ksu.outputs.ksu_tag }}
       ksu_code: ${{ steps.ksu.outputs.ksu_code }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
@@ -411,7 +348,6 @@ jobs:
       - name: Free disk space
         run: |
           set -eu
-          echo "--- before ---"; df -h /
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
                       /usr/local/lib/android /opt/hostedtoolcache/CodeQL \
                       /opt/hostedtoolcache/go /opt/hostedtoolcache/Ruby || true
@@ -420,7 +356,6 @@ jobs:
                       google-chrome-stable google-cloud-cli >/dev/null 2>&1 || true
           sudo apt-get autoremove -y >/dev/null 2>&1 || true
           sudo apt-get clean || true
-          echo "--- after ---"; df -h /
 
       - name: Install host dependencies
         run: |
@@ -451,37 +386,26 @@ jobs:
           echo "selinux=$SEL" >> "$GITHUB_OUTPUT"
           echo "artifact=kernel-image-${KSU_VAR}-${SEL}-${CUS}" >> "$GITHUB_OUTPUT"
 
-      - name: External deps (SUSFS only)
-        if: env.KSU_VAR == 'KSUN-SUSFS-v1.5.12'
+      - name: External deps (SUSFS v2.2.0 only)
+        if: env.KSU_VAR == 'KSUN-SUSFS-v2.2.0'
         run: |
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           [ -d susfs4ksu ] || git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          ( cd susfs4ksu
-            git fetch --depth 1 origin f450ec00bf592d080f59b01ff6f9242456c9a427 || true
-            git checkout f450ec00bf592d080f59b01ff6f9242456c9a427 || true )
-          for repo in https://github.com/xnnnsets/kernel_patches.git \
-                      https://github.com/xnnnsets/patch.git \
-                      https://github.com/SukiSU-Ultra/SukiSU_patch.git; do
-            dir=$(basename "$repo" .git); [ -d "$dir" ] || git clone "$repo" --depth 1
-          done
 
-      - name: SUSFS kernel patches
-        if: env.KSU_VAR == 'KSUN-SUSFS-v1.5.12'
+      - name: SUSFS v2.2.0 kernel patches
+        if: env.KSU_VAR == 'KSUN-SUSFS-v2.2.0'
         run: |
           set -eu
           SUSFS_DIR="$G_EXT/susfs4ksu"
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/*            "$G_KERNEL/fs/"            || true
           cd "$G_KERNEL"
-          for p in "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" \
-                   "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" \
-                   "$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
-                   "$G_EXT/kernel_patches/wild/susfs_fix_patches/v1.5.12/1_fix_base.c.patch"; do
-            echo "--- $(basename "$p")"
-            patch -p1 --forward --batch < "$p" || echo "::warning::$(basename "$p") failed / already applied"
-          done
-          # GKI protected exports block SUSFS symbols
+          
+          PATCH_FILE="$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"
+          echo "--- Applying $(basename "$PATCH_FILE")"
+          patch -p1 --forward --batch < "$PATCH_FILE" || echo "::warning::$(basename "$PATCH_FILE") failed or partially applied"
+
           grep -rl "protected_exports_list" --include="BUILD.bazel" "$GITHUB_WORKSPACE/$REAL_DIR" 2>/dev/null | while read -r f; do
             sed -i '/"protected_exports_list"[[:space:]]*:[[:space:]]*"android\/abi_gki_protected_exports_aarch64",\?/d' "$f"
           done
@@ -496,21 +420,16 @@ jobs:
           rm -rf KernelSU-Next
           case "$KSU_VAR" in
             KSUN)
-              # setup.sh does a FRESH clone every run -> always the newest dev
-              # HEAD, today and in a year. No tag, no pinning, no input.
               curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev/kernel/setup.sh -o /tmp/ksun_setup.sh
               sh /tmp/ksun_setup.sh dev
               ;;
-            KSUN-SUSFS-v1.5.12)
-              curl -LSs --retry 3 https://raw.githubusercontent.com/xnnnsets/KernelSU-Next/refs/heads/next-1/kernel/setup.sh -o /tmp/ksun_setup.sh
-              sh /tmp/ksun_setup.sh next-1
-              for p in "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
-                       "$G_EXT/kernel_patches/wild/susfs_fix_patches/v1.5.12/fix_core_hook.c.patch" \
-                       "$G_EXT/kernel_patches/wild/susfs_fix_patches/v1.5.12/fix_sucompat.c.patch" \
-                       "$G_EXT/kernel_patches/wild/susfs_fix_patches/v1.5.12/fix_kernel_compat.c.patch"; do
-                echo "--- $(basename "$p")"
-                patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || echo "::warning::$(basename "$p") failed / already applied"
-              done
+            KSUN-SUSFS-v2.2.0)
+              curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/next/kernel/setup.sh -o /tmp/ksun_setup.sh
+              sh /tmp/ksun_setup.sh next
+              
+              SUS_PATCH="$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+              echo "--- Applying SUSFS v2.2.0 patch to KernelSU-Next"
+              patch -p1 -d ./KernelSU-Next --forward --batch < "$SUS_PATCH" || echo "::warning::10_enable_susfs_for_ksu.patch failed or already applied"
               ;;
           esac
           [ -d KernelSU-Next ] || { echo "::error::KernelSU-Next missing after setup.sh"; exit 1; }
@@ -519,30 +438,17 @@ jobs:
           KSU_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
           KSU_CODE=$((30000 + $(git rev-list --count HEAD 2>/dev/null || echo 0)))
           KSU_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
-          # Fix "v0.0.1 (1-2)" in the manager: build_kernel.sh copies the tree
-          # into the bazel workspace with `rsync --copy-links`, which turns the
-          # drivers/kernelsu -> ../KernelSU-Next/kernel symlink into a plain
-          # copy. Kbuild can then no longer find its own git repo and falls back
-          # to KSU_VERSION=1 / KSU_VERSION_TAG=v0.0.1 -> bake in the real values.
           if [ -f kernel/Kbuild ] && grep -q KSU_VERSION_FALLBACK kernel/Kbuild; then
             sed -i "s|^KSU_VERSION_FALLBACK := .*|KSU_VERSION_FALLBACK := ${KSU_CODE}|"        kernel/Kbuild
             sed -i "s|^KSU_VERSION_TAG_FALLBACK := .*|KSU_VERSION_TAG_FALLBACK := ${KSU_TAG}|" kernel/Kbuild
-            grep -n "KSU_VERSION_FALLBACK\|KSU_VERSION_TAG_FALLBACK" kernel/Kbuild
-          else
-            echo "::warning::KSU_VERSION_FALLBACK not found in kernel/Kbuild (layout changed?)"
           fi
           { echo "KSU_GIT_TAG=$KSU_TAG"; echo "KSU_VERSION=$KSU_CODE"; echo "KSU_COMMIT=$KSU_SHA"; } >> "$GITHUB_ENV"
           { echo "ksu_tag=$KSU_TAG"; echo "ksu_code=$KSU_CODE"; } >> "$GITHUB_OUTPUT"
-          echo "KernelSU-Next $KSU_TAG ($KSU_CODE) @ $KSU_SHA"
 
       - name: Defconfig (KSU + IPSet)
         run: |
           set -eu
           DEFCONFIG="$G_KERNEL/arch/arm64/configs/gki_defconfig"
-          # Everything we add lives between markers, so re-running only ever
-          # replaces our own block and never touches upstream lines (the old
-          # code deleted CONFIG_KPROBES=y and only put it back for KSUN, so
-          # NO-ROOT builds silently lost kprobes).
           sed -i '/^# >>> a346e-ci$/,/^# <<< a346e-ci$/d' "$DEFCONFIG"
           echo "# >>> a346e-ci" >> "$DEFCONFIG"
 
@@ -555,31 +461,28 @@ jobs:
           CONFIG_MODULES=y
           EOF
               ;;
-            KSUN-SUSFS-v1.5.12)
+            KSUN-SUSFS-v2.2.0)
               cat >> "$DEFCONFIG" <<'EOF'
           CONFIG_KSU=y
-          CONFIG_KSU_KPROBES_HOOK=n
           CONFIG_MODULES=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
           CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
-          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
           CONFIG_KSU_SUSFS_SUS_KSTAT=y
           CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_SUS_SU=n
           EOF
               ;;
           esac
 
-          # IPSet (needed by most firewall / adblock apps) -- all variants
           cat >> "$DEFCONFIG" <<'EOF'
           CONFIG_IP_SET=y
           CONFIG_IP_SET_MAX=65534
@@ -601,18 +504,12 @@ jobs:
           CONFIG_IP_SET_LIST_SET=y
           EOF
           echo "# <<< a346e-ci" >> "$DEFCONFIG"
-          echo "--- defconfig tail ---"; tail -n 30 "$DEFCONFIG"
 
-      # build_kernel.sh applies, in this order:
-      #   apply_optional_patches : Permissive/ (PERMISSIVE=true) + patch/*.patch (CUSTOM_PATCH=true)
-      #   apply_kernel66_patches : kernel/patches-kernel-6.6/*.patch (always)
-      #   apply_compat_fixes     : inline loop.h / MAX-MIN / SEC_PM fixes
       - name: Build kernel
         id: build
         run: |
           set -eu
           chmod +x ./build_kernel.sh
-          echo "PERMISSIVE=$PERMISSIVE  CUSTOM_PATCH=$CUSTOM_PATCH  KSU_VAR=$KSU_VAR"
           if ! bash ./build_kernel.sh 2>&1 | tee build.log; then
             echo "::error::build_kernel.sh failed - see the build-log artifact"
             tail -n 60 build.log || true
@@ -621,22 +518,19 @@ jobs:
           [ -f Image ] || { echo "::error::Image not produced"; find out -name Image -type f | head; exit 1; }
           echo "image_size=$(du -h Image | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           echo "image_sha=$(sha256sum Image | cut -c1-16)"    >> "$GITHUB_OUTPUT"
-          if [ "$PERMISSIVE" = "true" ]; then
-            grep -q "SELinux permissive patch" build.log || echo "::warning::permissive requested but not confirmed in the log"
-          fi
           ls -lh Image
 
       - name: Upload Image
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.artifact }}
           path: Image
           if-no-files-found: error
           compression-level: 6
 
-      - name: Upload build log (only when the build fails)
+      - name: Upload build log (on failure)
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.run_id }}
           path: build.log
@@ -664,12 +558,12 @@ jobs:
             echo "| KernelSU-Next | \`${{ needs.build.outputs.ksu_tag || 'n/a' }}\` (\`${{ needs.build.outputs.ksu_code || 'n/a' }}\`) |"
             echo "| SELinux | \`${{ needs.build.outputs.selinux || env.PERMISSIVE }}\` |"
             echo "| Image | \`${{ needs.build.outputs.image_size || 'n/a' }}\` sha256:\`${{ needs.build.outputs.image_sha || 'n/a' }}\` |"
-            echo "| Artifact | \`${{ needs.build.outputs.artifact || 'n/a' }}\` (only the Image) |"
+            echo "| Artifact | \`${{ needs.build.outputs.artifact || 'n/a' }}\` |"
             echo ""
             echo "Pipeline: #1 ●──● #2 ●──● #3 ●──● #4 ●──● #5 ●──● #6 ●──● #7"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Open an issue when the build fails
+      - name: Open an issue on failure
         if: needs.build.result == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -686,6 +580,6 @@ jobs:
           | permissive | \`${PERMISSIVE}\` |
           | extra patches | \`${CUSTOM_PATCH}\` |
 
-          The \`build-log-${{ github.run_id }}\` artifact of that run has the full log.
+          The \`build-log-${{ github.run_id }}\` artifact has the full build log.
           EOF
           gh issue create --title "Build failed #${{ github.run_id }} [${KSU_VAR}]" --body-file issue.md || true
