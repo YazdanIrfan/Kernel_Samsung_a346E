@@ -139,11 +139,7 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
-          if [ "$KSU_VAR" = "KSUN" ]; then
-            URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev/kernel/setup.sh"
-          else
-            URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/next/kernel/setup.sh"
-          fi
+          URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh"
           curl -fsSL --retry 3 "$URL" -o /tmp/setup.sh
           head -n 1 /tmp/setup.sh | grep -q '^#!' || { echo "::error::setup.sh does not look like a script"; exit 1; }
           echo "setup.sh OK ($(wc -l < /tmp/setup.sh) lines) from $URL"
@@ -298,9 +294,9 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
-          REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
-          BRANCH=$([ "$KSU_VAR" = "KSUN" ] && echo "dev" || echo "next")
-          git clone --branch "$BRANCH" "$REPO" /tmp/ksun >/dev/null 2>&1
+          REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
+          BRANCH="dev"
+          git clone --branch "$BRANCH" --depth 1 "$REPO" /tmp/ksun >/dev/null 2>&1
           cd /tmp/ksun
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
           CODE=$((30000 + $(git rev-list --count HEAD)))
@@ -418,20 +414,16 @@ jobs:
           set -eu
           cd "$G_KERNEL"
           rm -rf KernelSU-Next
-          case "$KSU_VAR" in
-            KSUN)
-              curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/dev/kernel/setup.sh -o /tmp/ksun_setup.sh
-              sh /tmp/ksun_setup.sh dev
-              ;;
-            KSUN-SUSFS-v2.2.0)
-              curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/next/kernel/setup.sh -o /tmp/ksun_setup.sh
-              sh /tmp/ksun_setup.sh next
-              
-              SUS_PATCH="$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-              echo "--- Applying SUSFS v2.2.0 patch to KernelSU-Next"
-              patch -p1 -d ./KernelSU-Next --forward --batch < "$SUS_PATCH" || echo "::warning::10_enable_susfs_for_ksu.patch failed or already applied"
-              ;;
-          esac
+
+          curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh -o /tmp/ksun_setup.sh
+          sh /tmp/ksun_setup.sh dev
+
+          if [ "$KSU_VAR" = "KSUN-SUSFS-v2.2.0" ]; then
+            SUS_PATCH="$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+            echo "--- Applying SUSFS v2.2.0 patch to KernelSU-Next"
+            patch -p1 -d ./KernelSU-Next --forward --batch < "$SUS_PATCH" || echo "::warning::10_enable_susfs_for_ksu.patch failed or already applied"
+          fi
+
           [ -d KernelSU-Next ] || { echo "::error::KernelSU-Next missing after setup.sh"; exit 1; }
 
           cd KernelSU-Next
