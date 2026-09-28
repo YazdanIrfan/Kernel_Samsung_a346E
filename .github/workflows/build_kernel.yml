@@ -106,7 +106,6 @@ jobs:
         run: |
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
-          # Clone latest without pinning to a hardcoded commit
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
           
           for repo in https://github.com/xnnnsets/kernel_patches.git \
@@ -115,11 +114,9 @@ jobs:
             git clone "$repo" --depth 1
           done
           
-          # Dynamically target the newest wild patch version dir
           LATEST_SUS_DIR=$(ls -d kernel_patches/wild/susfs_fix_patches/v* | sort -V | tail -n 1)
-          
           MISSING=0
-          # We only hardcode static overarching patches here
+          
           for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
                    "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
                    "patch/6.6/Dont_reduce_TTL.patch" \
@@ -127,7 +124,6 @@ jobs:
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
           done
           
-          # Validate that the dynamically found latest directory actually contains patches
           if ! ls "$LATEST_SUS_DIR"/*.patch >/dev/null 2>&1; then
              echo "::error::No patches found in $LATEST_SUS_DIR"
              MISSING=1
@@ -258,14 +254,18 @@ jobs:
             patch -p1 --forward --batch < "$p" || true
           done
           
-          # Dynamically apply all remaining KERNEL-bound patches in the latest directory
+          # Use POSIX case statement to avoid [[ conditional expression errors
           shopt -s nullglob
           for p in "$LATEST_SUS_DIR"/*.patch; do
-            # We filter out KSU-bound patches so they don't break the main kernel apply
-            if [[ "$p" != *"fix_core_hook"* && "$p" != *"fix_sucompat"* && "$p" != *"fix_kernel_compat"* && "$p" != *"KernelSU"* ]]; then
-              echo "Applying Kernel-side fix: $(basename "$p")"
-              patch -p1 --forward --batch < "$p" || true
-            fi
+            case "$p" in
+              *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
+                # Skip KSU-bound patches in this step
+                ;;
+              *)
+                echo "Applying Kernel-side fix: $(basename "$p")"
+                patch -p1 --forward --batch < "$p" || true
+                ;;
+            esac
           done
           shopt -u nullglob
           
@@ -288,16 +288,17 @@ jobs:
               sh /tmp/ksun_setup.sh next-1
               LATEST_SUS_DIR=$(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -V | tail -n 1)
               
-              # Apply SUSFS base to KSU
               patch -p1 -d ./KernelSU-Next --forward --batch < "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
               
-              # Dynamically apply all KSU-bound fixes to the KSU tree
+              # Use POSIX case statement to apply only KSU-bound fixes
               shopt -s nullglob
               for p in "$LATEST_SUS_DIR"/*.patch; do
-                if [[ "$p" == *"fix_core_hook"* \vert{}\vert{} "$p" == *"fix_sucompat"* || "$p" == *"fix_kernel_compat"* \vert{}\vert{} "$p" == *"KernelSU"* ]]; then
-                  echo "Applying KSU-side fix: $(basename "$p")"
-                  patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
-                fi
+                case "$p" in
+                  *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
+                    echo "Applying KSU-side fix: $(basename "$p")"
+                    patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
+                    ;;
+                esac
               done
               shopt -u nullglob
               ;;
