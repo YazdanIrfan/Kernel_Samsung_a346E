@@ -11,7 +11,7 @@ on:
           - NO-ROOT
           - KSUN
           - KSUN-SUSFS
-        default: KSUN-SUSFS
+        default: KSUN
       permissive:
         description: "Make SELinux permissive?"
         type: boolean
@@ -32,7 +32,7 @@ on:
       - Game
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 concurrency:
@@ -114,7 +114,6 @@ jobs:
             git clone "$repo" --depth 1
           done
           
-          # Safely find the latest version directory that actually contains .patch files
           LATEST_SUS_DIR=""
           for d in $(ls -d kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
             if ls "$d"/*.patch >/dev/null 2>&1; then
@@ -132,7 +131,6 @@ jobs:
           
           MISSING=0
           for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
-                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
                    "patch/6.6/Dont_reduce_TTL.patch" \
                    "kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"; do
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
@@ -252,7 +250,6 @@ jobs:
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/* "$G_KERNEL/fs/" || true
           
-          # Same safe discovery logic
           LATEST_SUS_DIR=""
           for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
             if ls "$d"/*.patch >/dev/null 2>&1; then
@@ -262,12 +259,17 @@ jobs:
           done
           
           cd "$G_KERNEL"
-          for p in "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" \
-                   "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" \
-                   "$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch"; do
-            patch -p1 --forward --batch < "$p" || true
-          done
           
+          # 1. Main SUSFS Patch MUST go first
+          echo "Applying Base SUSFS Patch..."
+          patch -p1 --forward --batch < "$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" || true
+          
+          # 2. Apply hooks and TTL
+          echo "Applying Hooks and TTL..."
+          patch -p1 --forward --batch < "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" || true
+          patch -p1 --forward --batch < "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" || true
+          
+          # 3. Apply wild fixes dynamically
           shopt -s nullglob
           for p in "$LATEST_SUS_DIR"/*.patch; do
             case "$p" in
@@ -299,7 +301,6 @@ jobs:
               curl -LSs --retry 3 https://raw.githubusercontent.com/xnnnsets/KernelSU-Next/refs/heads/next-1/kernel/setup.sh -o /tmp/ksun_setup.sh
               sh /tmp/ksun_setup.sh next-1
               
-              # Same safe discovery logic
               LATEST_SUS_DIR=""
               for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
                 if ls "$d"/*.patch >/dev/null 2>&1; then
@@ -308,13 +309,17 @@ jobs:
                 fi
               done
               
-              patch -p1 -d ./KernelSU-Next --forward --batch < "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+              # Use SukiSU patches specifically designed for KernelSU-Next instead of official KSU patch
+              find "$G_EXT/SukiSU_patch" -type f -name "*.patch" | sort | while read -r p; do
+                echo "Applying SukiSU KSU fix: $(basename "$p")"
+                patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
+              done
               
               shopt -s nullglob
               for p in "$LATEST_SUS_DIR"/*.patch; do
                 case "$p" in
                   *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
-                    echo "Applying KSU-side fix: $(basename "$p")"
+                    echo "Applying KSU-side wild fix: $(basename "$p")"
                     patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
                     ;;
                 esac
@@ -396,15 +401,43 @@ jobs:
         run: |
           set -eu
           chmod +x ./build_kernel.sh
-          if ! bash ./build_kernel.sh 2>&1 | tee build.log; then exit 1; fi
-          echo "image_size=$(du -h Image | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          echo "image_sha=$(sha256sum Image \vert{} cut -c1-16)" >> "$GITHUB_OUTPUT"
+          if ! bash ./build_kernel.sh 2>&1 | tee build.log; then 
+            echo "build_kernel.sh exited with an error"
+          fi
+          
+          # Safely ensure Image exists before calculating size
+          if [ ! -f Image ]; then
+            find out -name "Image" -type f | grep -v ".*\.d$" | head -n 1 | xargs -I {} cp -v {} Image || true
+          fi
+          
+          if [ -f Image ]; then
+            echo "image_size=$(du -h Image | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+            echo "image_sha=$(sha256sum Image \vert{} cut -c1-16)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Image file not found! Kernel compilation failed."
+            exit 1
+          fi
 
-      - name: Upload Image
+      - name: Upload Image Artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.meta.outputs.artifact }}
           path: Image
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.artifact }}-${{ github.run_id }}
+          name: "${{ steps.meta.outputs.artifact }} (Run${{ github.run_id }})"
+          files: Image
+          body: |
+            ### Kernel Build Completed
+            - **Variant:** ${{ env.KSU_VAR }}
+            - **SELinux:** ${{ steps.meta.outputs.selinux }}
+            - **Extra Patches:** ${{ env.CUSTOM_PATCH }}
+            - **SHA256 Checksum:** `${{ steps.build.outputs.image_sha }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   upload-summary:
     name: "#7 Upload & Summary"
