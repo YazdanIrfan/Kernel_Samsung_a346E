@@ -109,12 +109,9 @@ jobs:
           
           # Fetch modern SUSFS base
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          
-          for repo in https://github.com/xnnnsets/kernel_patches.git \
-                      https://github.com/xnnnsets/patch.git \
-                      https://github.com/SukiSU-Ultra/SukiSU_patch.git; do
-            git clone "$repo" --depth 1
-          done
+          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
+          git clone https://github.com/xnnnsets/patch.git --depth 1
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
           
           LATEST_SUS_DIR=""
           for d in $(ls -d kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
@@ -130,6 +127,16 @@ jobs:
           fi
           
           echo "Using SUSFS fix directory: $LATEST_SUS_DIR"
+          
+          MISSING=0
+          for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
+                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
+                   "patch/6.6/Dont_reduce_TTL.patch" \
+                   "kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"; do
+            if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
+          done
+          
+          [ "$MISSING" = "0" ] || exit 1
 
   patches:
     name: "#4 Patches"
@@ -174,9 +181,9 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
-          # Use the latest active Next branches
+          # Use main branch for KernelSU-Next 3.4.0+
           REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
-          BRANCH=next
+          BRANCH=main
           
           git clone --branch "$BRANCH" "$REPO" /tmp/ksun >/dev/null 2>&1
           cd /tmp/ksun
@@ -230,9 +237,9 @@ jobs:
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          for repo in https://github.com/xnnnsets/kernel_patches.git https://github.com/xnnnsets/patch.git https://github.com/SukiSU-Ultra/SukiSU_patch.git; do
-            git clone "$repo" --depth 1
-          done
+          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
+          git clone https://github.com/xnnnsets/patch.git --depth 1
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
 
       - name: SUSFS kernel patches
         if: env.KSU_VAR == 'KSUN-SUSFS'
@@ -259,19 +266,19 @@ jobs:
           patch -p1 --forward --batch < "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" || true
           patch -p1 --forward --batch < "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" || true
           
-          # CRITICAL FIX: The hooks patch removes these definitions but forgets to remove the export, breaking the build.
-          # We manually comment them out so compilation succeeds.
-          echo "Applying Tracepoint Compilation Fixes..."
+          echo "Fixing Tracepoint Compiler Crash..."
+          # This prevents the EXPORT_TRACEPOINT_SYMBOL_GPL errors from crashing the build
           sed -i 's/EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mmc_sdio_pm_flag_set);/\/\/ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mmc_sdio_pm_flag_set);/g' drivers/android/vendor_hooks.c || true
           sed -i 's/EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mmc_gpio_cd_irqt);/\/\/ EXPORT_TRACEPOINT_SYMBOL_GPL(android_vh_mmc_gpio_cd_irqt);/g' drivers/android/vendor_hooks.c || true
           
+          echo "Applying Kernel-side Wild Fixes..."
           shopt -s nullglob
           for p in "$LATEST_SUS_DIR"/*.patch; do
             case "$p" in
               *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
                 ;;
               *)
-                echo "Applying Kernel-side fix: $(basename "$p")"
+                echo "Applying: $(basename "$p")"
                 patch -p1 --forward --batch < "$p" || true
                 ;;
             esac
@@ -288,9 +295,10 @@ jobs:
           cd "$G_KERNEL"
           rm -rf KernelSU-Next
           
-          # Fetch the modern KSUN `next` branch
-          curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/refs/heads/next/kernel/setup.sh -o /tmp/ksun_setup.sh
-          sh /tmp/ksun_setup.sh next
+          # Use main branch setup script for KSUN 3.4.0+
+          echo "Fetching KernelSU-Next (main)..."
+          curl -LSs --retry 3 https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh -o /tmp/ksun_setup.sh
+          bash /tmp/ksun_setup.sh main
           
           if [ "$KSU_VAR" = "KSUN-SUSFS" ]; then
             LATEST_SUS_DIR=""
@@ -301,19 +309,37 @@ jobs:
               fi
             done
             
-            # SAFE PATCHING: Older KSU patches break the modern KSUN code causing 'sh_path' undefined errors. 
-            # If a patch fails on KSUN, we safely revert it so compilation isn't interrupted by broken halfway-patches.
-            echo "Applying SukiSU/KSU fixes safely..."
-            find "$G_EXT/SukiSU_patch" "$LATEST_SUS_DIR" -type f -name "*.patch" | sort | while read -r p; do
-              if [[ "$p" == *"fix_core_hook"* || "$p" == *"fix_sucompat"* \vert{}\vert{} "$p" == *"fix_kernel_compat"* || "$p" == *"KernelSU"* \vert{}\vert{} "$p" == *"10_enable_susfs"* ]]; then
-                echo "Attempting to apply: $(basename "$p")"
-                if ! patch -p1 -d ./KernelSU-Next --forward --batch < "$p"; then
-                  echo "WARNING: Patch $(basename "$p") is incompatible with latest KSUN. Reverting to preserve build..."
-                  git -C ./KernelSU-Next reset --hard > /dev/null
-                  git -C ./KernelSU-Next clean -fd > /dev/null
-                fi
+            echo "Applying SUSFS patches to KernelSU-Next Safely..."
+            
+            # Safe application function: resets KSUN to clean state if a patch fails
+            apply_safely() {
+              local patch_file="$1"
+              echo "Attempting to apply: $(basename "$patch_file")"
+              if ! patch -p1 -d ./KernelSU-Next --forward --batch < "$patch_file"; then
+                echo "WARNING: Patch incompatible with KSUN v3.4.0. Reverting KSUN changes to preserve build..."
+                git -C ./KernelSU-Next reset --hard >/dev/null 2>&1
+                git -C ./KernelSU-Next clean -fd >/dev/null 2>&1
               fi
+            }
+            
+            # Apply base KSU SUSFS patch
+            apply_safely "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+            
+            # Apply SukiSU fixes
+            find "$G_EXT/SukiSU_patch" -type f -name "*.patch" | sort | while read -r p; do
+              apply_safely "$p"
             done
+            
+            # Apply remaining KSU-side wild fixes
+            shopt -s nullglob
+            for p in "$LATEST_SUS_DIR"/*.patch; do
+              case "$p" in
+                *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
+                  apply_safely "$p"
+                  ;;
+              esac
+            done
+            shopt -u nullglob
           fi
           
           cd KernelSU-Next
