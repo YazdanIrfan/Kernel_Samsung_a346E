@@ -11,7 +11,7 @@ on:
           - NO-ROOT
           - KSUN
           - KSUN-SUSFS
-        default: KSUN
+        default: KSUN-SUSFS
       permissive:
         description: "Make SELinux permissive?"
         type: boolean
@@ -41,7 +41,7 @@ concurrency:
 
 env:
   G_EXT: ${{ github.workspace }}/external_deps
-  KSU_VAR: ${{ github.event.inputs.ksu_variant || (github.event_name == 'push' && 'KSUN') || 'NO-ROOT' }}
+  KSU_VAR: ${{ github.event.inputs.ksu_variant || (github.event_name == 'push' && 'KSUN-SUSFS') || 'NO-ROOT' }}
   PERMISSIVE: ${{ github.event.inputs.permissive || 'false' }}
   CUSTOM_PATCH: ${{ github.event.inputs.custom_patches || 'false' }}
 
@@ -114,9 +114,23 @@ jobs:
             git clone "$repo" --depth 1
           done
           
-          LATEST_SUS_DIR=$(ls -d kernel_patches/wild/susfs_fix_patches/v* | sort -V | tail -n 1)
-          MISSING=0
+          # Safely find the latest version directory that actually contains .patch files
+          LATEST_SUS_DIR=""
+          for d in $(ls -d kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
+            if ls "$d"/*.patch >/dev/null 2>&1; then
+              LATEST_SUS_DIR="$d"
+              break
+            fi
+          done
           
+          if [ -z "$LATEST_SUS_DIR" ]; then
+            echo "::error::No patch files found in any version directory under wild/susfs_fix_patches/"
+            exit 1
+          fi
+          
+          echo "Using SUSFS fix directory: $LATEST_SUS_DIR"
+          
+          MISSING=0
           for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
                    "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
                    "patch/6.6/Dont_reduce_TTL.patch" \
@@ -124,13 +138,6 @@ jobs:
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
           done
           
-          if ! ls "$LATEST_SUS_DIR"/*.patch >/dev/null 2>&1; then
-             echo "::error::No patches found in $LATEST_SUS_DIR"
-             MISSING=1
-          else
-             echo "OK      Found $(ls "$LATEST_SUS_DIR"/*.patch | wc -l) dynamic fix patches in $LATEST_SUS_DIR"
-          fi
-
           [ "$MISSING" = "0" ] || exit 1
 
   patches:
@@ -245,7 +252,14 @@ jobs:
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/* "$G_KERNEL/fs/" || true
           
-          LATEST_SUS_DIR=$(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -V | tail -n 1)
+          # Same safe discovery logic
+          LATEST_SUS_DIR=""
+          for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
+            if ls "$d"/*.patch >/dev/null 2>&1; then
+              LATEST_SUS_DIR="$d"
+              break
+            fi
+          done
           
           cd "$G_KERNEL"
           for p in "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" \
@@ -254,12 +268,10 @@ jobs:
             patch -p1 --forward --batch < "$p" || true
           done
           
-          # Use POSIX case statement to avoid [[ conditional expression errors
           shopt -s nullglob
           for p in "$LATEST_SUS_DIR"/*.patch; do
             case "$p" in
               *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
-                # Skip KSU-bound patches in this step
                 ;;
               *)
                 echo "Applying Kernel-side fix: $(basename "$p")"
@@ -286,11 +298,18 @@ jobs:
             KSUN-SUSFS)
               curl -LSs --retry 3 https://raw.githubusercontent.com/xnnnsets/KernelSU-Next/refs/heads/next-1/kernel/setup.sh -o /tmp/ksun_setup.sh
               sh /tmp/ksun_setup.sh next-1
-              LATEST_SUS_DIR=$(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -V | tail -n 1)
+              
+              # Same safe discovery logic
+              LATEST_SUS_DIR=""
+              for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
+                if ls "$d"/*.patch >/dev/null 2>&1; then
+                  LATEST_SUS_DIR="$d"
+                  break
+                fi
+              done
               
               patch -p1 -d ./KernelSU-Next --forward --batch < "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
               
-              # Use POSIX case statement to apply only KSU-bound fixes
               shopt -s nullglob
               for p in "$LATEST_SUS_DIR"/*.patch; do
                 case "$p" in
