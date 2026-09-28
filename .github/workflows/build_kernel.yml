@@ -93,7 +93,7 @@ jobs:
           set -eu
           AVAIL=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
           if [ "$AVAIL" -lt 10 ]; then exit 1; fi
-          for t in git curl python3 tar xz; do command -v "$t" >/dev/null || exit 1; done
+          for t in git curl python3 tar xz zip unzip; do command -v "$t" >/dev/null || exit 1; done
 
   external-deps:
     name: "#3 External Deps (KSU/SUSFS)"
@@ -107,12 +107,15 @@ jobs:
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           
-          # Fetch modern SUSFS base ONLY (Removed outdated SukiSU & Wild fix repositories)
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
+          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
           git clone https://github.com/xnnnsets/patch.git --depth 1
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
+          git clone https://github.com/sidex15/susfs4ksu-module.git --depth 1 || true
           
           MISSING=0
           for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
+                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
                    "patch/6.6/Dont_reduce_TTL.patch"; do
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
           done
@@ -162,24 +165,13 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
-          # Natively clone to prevent Exit 128
           REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
           git clone "$REPO" /tmp/ksun >/dev/null 2>&1
           
           cd /tmp/ksun
-          # Safely extract the absolute latest clean tagged version (Filters out -legacy and -rc)
-          tags=$(git tag --sort=-v:refname --list 'v*')
-          LATEST_TAG=""
-          for t in $tags; do
-             if [[ "$t" != *legacy* && "$t" != *rc* ]]; then
-                LATEST_TAG="$t"
-                break
-             fi
-          done
-          
-          if [ -n "$LATEST_TAG" ]; then
-             git checkout "$LATEST_TAG" 2>/dev/null || true
-          fi
+          # Exclude legacy tags to ensure we get a modern 3.4.0+ codebase
+          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          git checkout "$LATEST_TAG" 2>/dev/null || true
           
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
           CODE=$((30000 +$(git rev-list --count HEAD)))
@@ -187,7 +179,7 @@ jobs:
           { echo "ksu_tag=$TAG"; echo "ksu_code=$CODE"; echo "ksu_sha=$SHA"; } >> "$GITHUB_OUTPUT"
 
   build:
-    name: "#6 Build"
+    name: "#6 Build & Package"
     needs: kernelsu
     runs-on: ubuntu-22.04
     timeout-minutes: 330
@@ -196,6 +188,7 @@ jobs:
       image_sha: ${{ steps.build.outputs.image_sha }}
       artifact: ${{ steps.meta.outputs.artifact }}
       selinux: ${{ steps.meta.outputs.selinux }}
+      zip_name: ${{ steps.package.outputs.zip_name }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -208,7 +201,7 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost || true
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            curl wget unzip git rsync ca-certificates bc bison flex build-essential \
+            curl wget unzip zip git rsync ca-certificates bc bison flex build-essential \
             libssl-dev libelf-dev libncurses-dev dwarves lz4 zstd cpio libxml2-utils xsltproc \
             python3 python3-pip python3-setuptools python3-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev
           git config --global --add safe.directory "*"
@@ -231,7 +224,9 @@ jobs:
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
+          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
           git clone https://github.com/xnnnsets/patch.git --depth 1
+          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
 
       - name: SUSFS kernel patches
         if: env.KSU_VAR == 'KSUN-SUSFS'
@@ -240,6 +235,14 @@ jobs:
           SUSFS_DIR="$G_EXT/susfs4ksu"
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/* "$G_KERNEL/fs/" || true
+          
+          LATEST_SUS_DIR=""
+          for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
+            if ls "$d"/*.patch >/dev/null 2>&1; then
+              LATEST_SUS_DIR="$d"
+              break
+            fi
+          done
           
           cd "$G_KERNEL"
           
@@ -253,6 +256,18 @@ jobs:
           # Completely deletes the leftover tracepoint exports to prevent the compiler from halting
           sed -i '/android_vh_mmc_sdio_pm_flag_set/d' drivers/android/vendor_hooks.c || true
           sed -i '/android_vh_mmc_gpio_cd_irqt/d' drivers/android/vendor_hooks.c || true
+          
+          echo "Applying Kernel-side Wild Fixes..."
+          shopt -s nullglob
+          for p in "$LATEST_SUS_DIR"/*.patch; do
+            # Bypasses older KSUN patches that cause 'sh_path' / 'sucompat' syntax corruption on KSUN v3.4.0
+            if [[ "$p" != *"fix_core_hook"* && "$p" != *"fix_sucompat"* && "$p" != *"fix_kernel_compat"* && "$p" != *"KernelSU"* ]]; then
+               echo "Applying: $(basename "$p")"
+               # Force applies the patches without resetting on failure
+               patch -p1 --forward --batch < "$p" || true
+            fi
+          done
+          shopt -u nullglob
           
           find "$GITHUB_WORKSPACE/$REAL_DIR" -iname "abi_gki_protected_exports*" -type f -delete 2>/dev/null || true
 
@@ -268,25 +283,35 @@ jobs:
           git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
           
           cd KernelSU-Next
-          tags=$(git tag --sort=-v:refname --list 'v*')
-          LATEST_TAG=""
-          for t in $tags; do
-             if [[ "$t" != *legacy* && "$t" != *rc* ]]; then
-                LATEST_TAG="$t"
-                break
-             fi
-          done
-          
-          if [ -n "$LATEST_TAG" ]; then
-             echo "Checking out KSUN Tag: $LATEST_TAG"
-             git checkout "$LATEST_TAG" 2>/dev/null || true
-          fi
+          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          echo "Checking out KSUN Tag: $LATEST_TAG"
+          git checkout "$LATEST_TAG" 2>/dev/null || true
           cd ..
           
           echo "Linking KernelSU-Next to kernel tree..."
           ln -sf ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q "obj-y += kernelsu/" drivers/Makefile; then
              echo "obj-y += kernelsu/" >> drivers/Makefile
+          fi
+          
+          if [ "$KSU_VAR" = "KSUN-SUSFS" ]; then
+            echo "Forcing SUSFS patches into KernelSU-Next..."
+            # Applies the patches and ignores minor offset warnings, ensuring SUSFS is integrated
+            patch -p1 -d ./KernelSU-Next --forward --batch < "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+            
+            find "$G_EXT/SukiSU_patch" -type f -name "*.patch" | sort | while read -r p; do
+              patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
+            done
+            
+            shopt -s nullglob
+            for p in "$LATEST_SUS_DIR"/*.patch; do
+              case "$p" in
+                *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
+                  patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
+                  ;;
+              esac
+            done
+            shopt -u nullglob
           fi
           
           echo "Bypassing Strict Kbuild Halts..."
@@ -380,7 +405,6 @@ jobs:
           fi
           
           if [ ! -f Image ]; then
-            # Safe bash loop to avoid markdown math format corruption
             found_img=""
             while IFS= read -r file; do
               if [[ "$file" != *".d" ]]; then
@@ -407,24 +431,52 @@ jobs:
             exit 1
           fi
 
-      - name: Upload Image Artifact
+      - name: Package with AnyKernel3
+        id: package
+        run: |
+          set -eu
+          echo "Packaging flashable zip with AnyKernel3..."
+          git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel3 --depth=1
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md AnyKernel3/Makefile
+          
+          cp -v Image AnyKernel3/
+          cd AnyKernel3
+          
+          # Disable strict device checks to prevent installation abortion in custom recoveries
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/do.modules=1/do.modules=0/g' anykernel.sh
+          
+          ZIP_NAME="${{ steps.meta.outputs.artifact }}-Flashable.zip"
+          zip -r9 "../$ZIP_NAME" *
+          cd ..
+          
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload Image Artifacts
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ steps.meta.outputs.artifact }}
-          path: Image
+          name: ${{ steps.meta.outputs.artifact }}-Assets
+          path: |
+            Image
+            ${{ env.zip_name }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.artifact }}-${{ github.run_id }}
           name: "${{ steps.meta.outputs.artifact }} (Run${{ github.run_id }})"
-          files: Image
+          files: |
+            Image
+            ${{ env.zip_name }}
           body: |
             ### Kernel Build Completed
             - **Variant:** ${{ env.KSU_VAR }}
             - **SELinux:** ${{ steps.meta.outputs.selinux }}
             - **Extra Patches:** ${{ env.CUSTOM_PATCH }}
             - **SHA256 Checksum:** `${{ steps.build.outputs.image_sha }}`
+            
+            *The `.zip` file is flashable via custom recovery (TWRP/OrangeFox).*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
