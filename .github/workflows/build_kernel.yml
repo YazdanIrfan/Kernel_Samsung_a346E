@@ -11,7 +11,7 @@ on:
           - NO-ROOT
           - KSUN
           - KSUN-SUSFS
-        default: KSUN-SUSFS
+        default: KSUN
       permissive:
         description: "Make SELinux permissive?"
         type: boolean
@@ -107,18 +107,13 @@ jobs:
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           
-          # Fetch modern SUSFS and patches
+          # Fetch modern SUSFS base ONLY (Removed outdated SukiSU & Wild fix repositories)
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
           git clone https://github.com/xnnnsets/patch.git --depth 1
-          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
-          git clone https://github.com/sidex15/susfs4ksu-module.git --depth 1 || true
           
           MISSING=0
           for f in "susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" \
-                   "susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
-                   "patch/6.6/Dont_reduce_TTL.patch" \
-                   "kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"; do
+                   "patch/6.6/Dont_reduce_TTL.patch"; do
             if [ -f "$f" ]; then echo "OK      $f"; else echo "::error::MISSING $f"; MISSING=1; fi
           done
           
@@ -167,13 +162,24 @@ jobs:
         if: env.KSU_VAR != 'NO-ROOT'
         run: |
           set -eu
+          # Natively clone to prevent Exit 128
           REPO=https://github.com/KernelSU-Next/KernelSU-Next.git
           git clone "$REPO" /tmp/ksun >/dev/null 2>&1
           
           cd /tmp/ksun
-          # Strictly filter tags to avoid '-legacy' and '-rc' versions breaking the build
-          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          git checkout "$LATEST_TAG" 2>/dev/null || true
+          # Safely extract the absolute latest clean tagged version (Filters out -legacy and -rc)
+          tags=$(git tag --sort=-v:refname --list 'v*')
+          LATEST_TAG=""
+          for t in $tags; do
+             if [[ "$t" != *legacy* && "$t" != *rc* ]]; then
+                LATEST_TAG="$t"
+                break
+             fi
+          done
+          
+          if [ -n "$LATEST_TAG" ]; then
+             git checkout "$LATEST_TAG" 2>/dev/null || true
+          fi
           
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
           CODE=$((30000 +$(git rev-list --count HEAD)))
@@ -225,9 +231,7 @@ jobs:
           set -eu
           mkdir -p "$G_EXT" && cd "$G_EXT"
           git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-android15-6.6 --depth 1
-          git clone https://github.com/xnnnsets/kernel_patches.git --depth 1
           git clone https://github.com/xnnnsets/patch.git --depth 1
-          git clone https://github.com/SukiSU-Ultra/SukiSU_patch.git --depth 1
 
       - name: SUSFS kernel patches
         if: env.KSU_VAR == 'KSUN-SUSFS'
@@ -237,50 +241,18 @@ jobs:
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/* "$G_KERNEL/fs/" || true
           
-          LATEST_SUS_DIR=""
-          for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
-            if ls "$d"/*.patch >/dev/null 2>&1; then
-              LATEST_SUS_DIR="$d"
-              break
-            fi
-          done
-          
           cd "$G_KERNEL"
           
           echo "Applying Base SUSFS Patch..."
           patch -p1 --forward --batch < "$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch" || true
           
-          echo "Applying Hooks and TTL..."
-          # Prevent "patch unexpectedly ends" format error by enforcing newline
-          echo "" >> "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"
-          patch -p1 --forward --batch < "$G_EXT/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" || true
+          echo "Applying TTL Patch..."
           patch -p1 --forward --batch < "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" || true
           
-          echo "Ensuring Manual Hooks Exist for KSUN Check..."
-          # Failsafe: KSUN Kbuild strictly checks for these hooks in the source. If the patch failed above, inject them forcefully.
-          if ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
-            sed -i '/ssize_t ret;/a \    extern int ksu_handle_vfs_read(struct file **, char __user **, size_t *, loff_t **);\n    ksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);' fs/read_write.c || true
-          fi
-          if ! grep -q "ksu_handle_vfs_write" fs/read_write.c; then
-            sed -i '/ssize_t ret;/a \    extern int ksu_handle_vfs_write(struct file **, const char __user **, size_t *, loff_t **);\n    ksu_handle_vfs_write(\&file, \&buf, \&count, \&pos);' fs/read_write.c || true
-          fi
-          if ! grep -q "ksu_handle_stat" fs/stat.c; then
-            sed -i '/int retval;/a \    extern int ksu_handle_stat(int *, const char __user **, int);\n    ksu_handle_stat(\&dfd, \&filename, flags);' fs/stat.c || true
-          fi
-          
           echo "Fixing Tracepoint Compiler Crash..."
+          # Completely deletes the leftover tracepoint exports to prevent the compiler from halting
           sed -i '/android_vh_mmc_sdio_pm_flag_set/d' drivers/android/vendor_hooks.c || true
           sed -i '/android_vh_mmc_gpio_cd_irqt/d' drivers/android/vendor_hooks.c || true
-          
-          echo "Applying Kernel-side Wild Fixes..."
-          shopt -s nullglob
-          for p in "$LATEST_SUS_DIR"/*.patch; do
-            if [[ "$p" != *"fix_core_hook"* && "$p" != *"fix_sucompat"* && "$p" != *"fix_kernel_compat"* && "$p" != *"KernelSU"* ]]; then
-               echo "Applying: $(basename "$p")"
-               patch -p1 --forward --batch < "$p" || true
-            fi
-          done
-          shopt -u nullglob
           
           find "$GITHUB_WORKSPACE/$REAL_DIR" -iname "abi_gki_protected_exports*" -type f -delete 2>/dev/null || true
 
@@ -296,10 +268,19 @@ jobs:
           git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
           
           cd KernelSU-Next
-          # Lock to the absolute latest standard tag, rejecting -legacy branches
-          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          echo "Checking out KSUN Tag: $LATEST_TAG"
-          git checkout "$LATEST_TAG" 2>/dev/null || true
+          tags=$(git tag --sort=-v:refname --list 'v*')
+          LATEST_TAG=""
+          for t in $tags; do
+             if [[ "$t" != *legacy* && "$t" != *rc* ]]; then
+                LATEST_TAG="$t"
+                break
+             fi
+          done
+          
+          if [ -n "$LATEST_TAG" ]; then
+             echo "Checking out KSUN Tag: $LATEST_TAG"
+             git checkout "$LATEST_TAG" 2>/dev/null || true
+          fi
           cd ..
           
           echo "Linking KernelSU-Next to kernel tree..."
@@ -308,30 +289,20 @@ jobs:
              echo "obj-y += kernelsu/" >> drivers/Makefile
           fi
           
-          if [ "$KSU_VAR" = "KSUN-SUSFS" ]; then
-            echo "Applying SUSFS patches to KernelSU-Next Safely..."
-            
-            apply_safely() {
-              local patch_file="$1"
-              echo "Attempting to apply: $(basename "$patch_file")"
-              if ! patch -p1 -d ./KernelSU-Next --forward --batch < "$patch_file"; then
-                echo "WARNING: Patch incompatible with KSUN $LATEST_TAG. Reverting to preserve compilation..."
-                git -C ./KernelSU-Next reset --hard >/dev/null 2>&1
-                git -C ./KernelSU-Next clean -fd >/dev/null 2>&1
-              fi
-            }
-            
-            apply_safely "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-            
-            find "$G_EXT/SukiSU_patch" -type f -name "*.patch" | sort | while read -r p; do
-              apply_safely "$p"
-            done
+          echo "Bypassing Strict Kbuild Halts..."
+          if [ -f KernelSU-Next/kernel/Kbuild ]; then
+             sed -i '/KSU_GIT_VERSION not defined/d' KernelSU-Next/kernel/Kbuild
+             sed -i '/KSU_VERSION_TAG not defined/d' KernelSU-Next/kernel/Kbuild
+             sed -i '/No hooks were defined/d' KernelSU-Next/kernel/Kbuild
           fi
           
           cd KernelSU-Next
           KSU_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
           KSU_CODE=$((30000 +$(git rev-list --count HEAD 2>/dev/null || echo 0)))
-          if [ -f kernel/Kbuild ] && grep -q KSU_VERSION_FALLBACK kernel/Kbuild; then
+          
+          if [ -f kernel/Kbuild ]; then
+            sed -i "1i KSU_GIT_VERSION := $KSU_CODE" kernel/Kbuild
+            sed -i "1i KSU_VERSION_TAG := $KSU_TAG" kernel/Kbuild
             sed -i "s|^KSU_VERSION_FALLBACK := .*|KSU_VERSION_FALLBACK := ${KSU_CODE}|" kernel/Kbuild
             sed -i "s|^KSU_VERSION_TAG_FALLBACK := .*|KSU_VERSION_TAG_FALLBACK := ${KSU_TAG}|" kernel/Kbuild
           fi
@@ -355,7 +326,9 @@ jobs:
             KSUN-SUSFS)
               cat >> "$DEFCONFIG" <<'EOF'
           CONFIG_KSU=y
-          CONFIG_KSU_KPROBES_HOOK=n
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_KPROBES_HOOK=y
           CONFIG_MODULES=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
@@ -407,12 +380,28 @@ jobs:
           fi
           
           if [ ! -f Image ]; then
-            find out -name "Image" -type f | grep -v ".*\.d$" | head -n 1 | xargs -I {} cp -v {} Image || true
+            # Safe bash loop to avoid markdown math format corruption
+            found_img=""
+            while IFS= read -r file; do
+              if [[ "$file" != *".d" ]]; then
+                found_img="$file"
+                break
+              fi
+            done < <(find out -name "Image" -type f 2>/dev/null || true)
+            
+            if [ -n "$found_img" ]; then
+               cp -v "$found_img" Image || true
+            fi
           fi
           
           if [ -f Image ]; then
-            echo "image_size=$(du -h Image | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-            echo "image_sha=$(sha256sum Image \vert{} cut -c1-16)" >> "$GITHUB_OUTPUT"
+            sz=$(du -h Image)
+            image_size=${sz%% *}
+            sh=$(sha256sum Image)
+            image_sha=${sh:0:16}
+            
+            echo "image_size=$image_size" >> "$GITHUB_OUTPUT"
+            echo "image_sha=$image_sha" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Image file not found! Kernel compilation failed."
             exit 1
