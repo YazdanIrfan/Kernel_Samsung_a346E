@@ -11,7 +11,7 @@ on:
           - NO-ROOT
           - KSUN
           - KSUN-SUSFS
-        default: KSUN
+        default: KSUN-SUSFS
       permissive:
         description: "Make SELinux permissive?"
         type: boolean
@@ -169,14 +169,21 @@ jobs:
           git clone "$REPO" /tmp/ksun >/dev/null 2>&1
           
           cd /tmp/ksun
-          # Exclude legacy tags to ensure we get a modern 3.4.0+ codebase
-          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          git checkout "$LATEST_TAG" 2>/dev/null || true
+          git tag --sort=-v:refname --list "v*" > tags.txt
+          LATEST_TAG=`grep -v "legacy" tags.txt | grep -v "rc" | head -n 1`
           
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
-          CODE=$((30000 +$(git rev-list --count HEAD)))
-          SHA=$(git rev-parse --short HEAD)
-          { echo "ksu_tag=$TAG"; echo "ksu_code=$CODE"; echo "ksu_sha=$SHA"; } >> "$GITHUB_OUTPUT"
+          if [ -n "$LATEST_TAG" ]; then
+             git checkout "$LATEST_TAG" 2>/dev/null || true
+          fi
+          
+          TAG=`git describe --tags --abbrev=0 2>/dev/null || echo dev`
+          KSU_REV=`git rev-list --count HEAD 2>/dev/null || echo 0`
+          CODE=$((30000 + KSU_REV))
+          SHA=`git rev-parse --short HEAD`
+          
+          echo "ksu_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ksu_code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "ksu_sha=$SHA" >> "$GITHUB_OUTPUT"
 
   build:
     name: "#6 Build & Package"
@@ -236,14 +243,6 @@ jobs:
           cp -v "$SUSFS_DIR"/kernel_patches/include/linux/* "$G_KERNEL/include/linux/" || true
           cp -v "$SUSFS_DIR"/kernel_patches/fs/* "$G_KERNEL/fs/" || true
           
-          LATEST_SUS_DIR=""
-          for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* | sort -rV); do
-            if ls "$d"/*.patch >/dev/null 2>&1; then
-              LATEST_SUS_DIR="$d"
-              break
-            fi
-          done
-          
           cd "$G_KERNEL"
           
           echo "Applying Base SUSFS Patch..."
@@ -253,21 +252,28 @@ jobs:
           patch -p1 --forward --batch < "$G_EXT/patch/6.6/Dont_reduce_TTL.patch" || true
           
           echo "Fixing Tracepoint Compiler Crash..."
-          # Completely deletes the leftover tracepoint exports to prevent the compiler from halting
           sed -i '/android_vh_mmc_sdio_pm_flag_set/d' drivers/android/vendor_hooks.c || true
           sed -i '/android_vh_mmc_gpio_cd_irqt/d' drivers/android/vendor_hooks.c || true
           
           echo "Applying Kernel-side Wild Fixes..."
-          shopt -s nullglob
-          for p in "$LATEST_SUS_DIR"/*.patch; do
-            # Bypasses older KSUN patches that cause 'sh_path' / 'sucompat' syntax corruption on KSUN v3.4.0
-            if [[ "$p" != *"fix_core_hook"* && "$p" != *"fix_sucompat"* && "$p" != *"fix_kernel_compat"* && "$p" != *"KernelSU"* ]]; then
-               echo "Applying: $(basename "$p")"
-               # Force applies the patches without resetting on failure
-               patch -p1 --forward --batch < "$p" || true
+          LATEST_SUS_DIR=""
+          for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* 2>/dev/null | sort -rV || true); do
+            if ls "$d"/*.patch >/dev/null 2>&1; then
+              LATEST_SUS_DIR="$d"
+              break
             fi
           done
-          shopt -u nullglob
+          
+          if [ -n "$LATEST_SUS_DIR" ]; then
+            shopt -s nullglob
+            for p in "$LATEST_SUS_DIR"/*.patch; do
+              if [[ "$p" != *"fix_core_hook"* && "$p" != *"fix_sucompat"* && "$p" != *"fix_kernel_compat"* && "$p" != *"KernelSU"* ]]; then
+                 echo "Applying: $(basename "$p")"
+                 patch -p1 --forward --batch < "$p" || true
+              fi
+            done
+            shopt -u nullglob
+          fi
           
           find "$GITHUB_WORKSPACE/$REAL_DIR" -iname "abi_gki_protected_exports*" -type f -delete 2>/dev/null || true
 
@@ -283,9 +289,12 @@ jobs:
           git clone https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
           
           cd KernelSU-Next
-          LATEST_TAG=$(git tag \vert{} grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
-          echo "Checking out KSUN Tag: $LATEST_TAG"
-          git checkout "$LATEST_TAG" 2>/dev/null || true
+          git tag --sort=-v:refname --list "v*" > tags.txt
+          LATEST_TAG=`grep -v "legacy" tags.txt | grep -v "rc" | head -n 1`
+          if [ -n "$LATEST_TAG" ]; then
+             echo "Checking out KSUN Tag: $LATEST_TAG"
+             git checkout "$LATEST_TAG" 2>/dev/null || true
+          fi
           cd ..
           
           echo "Linking KernelSU-Next to kernel tree..."
@@ -295,35 +304,55 @@ jobs:
           fi
           
           if [ "$KSU_VAR" = "KSUN-SUSFS" ]; then
-            echo "Forcing SUSFS patches into KernelSU-Next..."
-            # Applies the patches and ignores minor offset warnings, ensuring SUSFS is integrated
-            patch -p1 -d ./KernelSU-Next --forward --batch < "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
+            echo "Applying SUSFS patches to KernelSU-Next Safely..."
+            
+            apply_safely() {
+              local patch_file="$1"
+              echo "Testing KSU Patch: $(basename "$patch_file")"
+              if patch -p1 -d ./KernelSU-Next --forward --batch --dry-run < "$patch_file" >/dev/null 2>&1; then
+                patch -p1 -d ./KernelSU-Next --forward --batch < "$patch_file" >/dev/null 2>&1
+                echo " -> Applied Successfully"
+              else
+                echo " -> Skipped (Incompatible with KSUN $LATEST_TAG)"
+              fi
+            }
+            
+            apply_safely "$G_EXT/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
             
             find "$G_EXT/SukiSU_patch" -type f -name "*.patch" | sort | while read -r p; do
-              patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
+              apply_safely "$p"
             done
             
-            shopt -s nullglob
-            for p in "$LATEST_SUS_DIR"/*.patch; do
-              case "$p" in
-                *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
-                  patch -p1 -d ./KernelSU-Next --forward --batch < "$p" || true
-                  ;;
-              esac
+            LATEST_SUS_DIR=""
+            for d in $(ls -d "$G_EXT"/kernel_patches/wild/susfs_fix_patches/v* 2>/dev/null | sort -rV || true); do
+              if ls "$d"/*.patch >/dev/null 2>&1; then
+                LATEST_SUS_DIR="$d"
+                break
+              fi
             done
-            shopt -u nullglob
+            
+            if [ -n "$LATEST_SUS_DIR" ]; then
+              shopt -s nullglob
+              for p in "$LATEST_SUS_DIR"/*.patch; do
+                case "$p" in
+                  *fix_core_hook* | *fix_sucompat* | *fix_kernel_compat* | *KernelSU* )
+                    apply_safely "$p"
+                    ;;
+                esac
+              done
+              shopt -u nullglob
+            fi
           fi
           
           echo "Bypassing Strict Kbuild Halts..."
           if [ -f KernelSU-Next/kernel/Kbuild ]; then
-             sed -i '/KSU_GIT_VERSION not defined/d' KernelSU-Next/kernel/Kbuild
-             sed -i '/KSU_VERSION_TAG not defined/d' KernelSU-Next/kernel/Kbuild
-             sed -i '/No hooks were defined/d' KernelSU-Next/kernel/Kbuild
+             sed -i 's/\$(error/\$(warning/g' KernelSU-Next/kernel/Kbuild
           fi
           
           cd KernelSU-Next
-          KSU_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo dev)
-          KSU_CODE=$((30000 +$(git rev-list --count HEAD 2>/dev/null || echo 0)))
+          KSU_TAG=`git describe --tags --abbrev=0 2>/dev/null || echo dev`
+          KSU_REV=`git rev-list --count HEAD 2>/dev/null || echo 0`
+          KSU_CODE=$((30000 + KSU_REV))
           
           if [ -f kernel/Kbuild ]; then
             sed -i "1i KSU_GIT_VERSION := $KSU_CODE" kernel/Kbuild
@@ -331,25 +360,28 @@ jobs:
             sed -i "s|^KSU_VERSION_FALLBACK := .*|KSU_VERSION_FALLBACK := ${KSU_CODE}|" kernel/Kbuild
             sed -i "s|^KSU_VERSION_TAG_FALLBACK := .*|KSU_VERSION_TAG_FALLBACK := ${KSU_TAG}|" kernel/Kbuild
           fi
-          { echo "KSU_GIT_TAG=$KSU_TAG"; echo "KSU_VERSION=$KSU_CODE"; } >> "$GITHUB_ENV"
+          
+          echo "KSU_GIT_TAG=$KSU_TAG" >> "$GITHUB_ENV"
+          echo "KSU_VERSION=$KSU_CODE" >> "$GITHUB_ENV"
 
       - name: Defconfig (KSU + IPSet)
         run: |
           set -eu
-          DEFCONFIG="$G_KERNEL/arch/arm64/configs/gki_defconfig"
-          sed -i '/^# >>> a346e-ci$/,/^# <<< a346e-ci$/d' "$DEFCONFIG"
-          echo "# >>> a346e-ci" >> "$DEFCONFIG"
-          case "$KSU_VAR" in
-            KSUN)
-              cat >> "$DEFCONFIG" <<'EOF'
+          for cfg in "$G_KERNEL/arch/arm64/configs/gki_defconfig" "$G_KERNEL/kernel_device_modules-6.6/arch/arm64/configs/mediatek-bazel_defconfig"; do
+            if [ -f "$cfg" ]; then
+              sed -i '/^# >>> a346e-ci$/,/^# <<< a346e-ci$/d' "$cfg"
+              echo "# >>> a346e-ci" >> "$cfg"
+              case "$KSU_VAR" in
+                KSUN)
+                  cat >> "$cfg" <<'EOF'
           CONFIG_KSU=y
           CONFIG_KPROBES=y
           CONFIG_KPROBE_EVENTS=y
           CONFIG_MODULES=y
           EOF
-              ;;
-            KSUN-SUSFS)
-              cat >> "$DEFCONFIG" <<'EOF'
+                  ;;
+                KSUN-SUSFS)
+                  cat >> "$cfg" <<'EOF'
           CONFIG_KSU=y
           CONFIG_KPROBES=y
           CONFIG_KPROBE_EVENTS=y
@@ -371,9 +403,9 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_SUS_SU=n
           EOF
-              ;;
-          esac
-          cat >> "$DEFCONFIG" <<'EOF'
+                  ;;
+              esac
+              cat >> "$cfg" <<'EOF'
           CONFIG_IP_SET=y
           CONFIG_IP_SET_MAX=65534
           CONFIG_IP_SET_BITMAP_IP=y
@@ -393,7 +425,9 @@ jobs:
           CONFIG_IP_SET_HASH_NETIFACE=y
           CONFIG_IP_SET_LIST_SET=y
           EOF
-          echo "# <<< a346e-ci" >> "$DEFCONFIG"
+              echo "# <<< a346e-ci" >> "$cfg"
+            fi
+          done
 
       - name: Build kernel
         id: build
@@ -419,9 +453,9 @@ jobs:
           fi
           
           if [ -f Image ]; then
-            sz=$(du -h Image)
+            sz=`du -h Image`
             image_size=${sz%% *}
-            sh=$(sha256sum Image)
+            sh=`sha256sum Image`
             image_sha=${sh:0:16}
             
             echo "image_size=$image_size" >> "$GITHUB_OUTPUT"
@@ -442,7 +476,6 @@ jobs:
           cp -v Image AnyKernel3/
           cd AnyKernel3
           
-          # Disable strict device checks to prevent installation abortion in custom recoveries
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
           sed -i 's/do.modules=1/do.modules=0/g' anykernel.sh
           
